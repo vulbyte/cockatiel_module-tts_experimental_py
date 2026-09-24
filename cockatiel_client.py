@@ -16,6 +16,7 @@ import logging
 import os
 import ssl
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
@@ -111,6 +112,9 @@ class CockatielClientBuilder:
         if tls_cert:
             ctx = ssl.create_default_context(cafile=tls_cert)
             ws_kwargs["ssl"] = ctx
+        # Bound the connect so the service's reconnect loop can back off instead
+        # of hanging forever on an unreachable engine.
+        ws_kwargs["open_timeout"] = 10.0
         ws = await websockets.connect(engine_ws_url, **ws_kwargs)
         logger.info("Connected to WebSocket! Sending authentication handshake...")
 
@@ -130,7 +134,11 @@ class CockatielClientBuilder:
         )
 
         await ws.send(handshake_container.SerializeToString())
-        raw = await ws.recv()
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        except asyncio.TimeoutError:
+            await ws.close()
+            raise ConnectionError("Authentication timed out: engine did not reply to handshake.")
 
         if isinstance(raw, str):
             await ws.close()
@@ -154,13 +162,18 @@ class CockatielClientBuilder:
 
 
 class CockatielClient:
-    def __init__(self, ws, module_name: str, auth_token: str, instance_uuid7: str):
+    def __init__(self, ws, module_name: str, auth_token: str, instance_uuid7: str, max_pending_tasks: int = 16):
         self._ws = ws
         self._module_name = module_name
         self._auth_token = auth_token
         self._instance_uuid7 = instance_uuid7
         self._send_lock = asyncio.Lock()
         self._callbacks: Dict[str, Callable[[Any, Any], Union[Awaitable[None], None]]] = {}
+        # Bounds the number of in-flight background handler tasks (e.g. slow TTS
+        # syntheses) so a chat flood can't accumulate tasks without bound. When
+        # at capacity the newest task is dropped with a log instead of queuing.
+        self._max_pending_tasks = max_pending_tasks
+        self._pending_tasks: "deque[asyncio.Task]" = deque()
 
     @property
     def auth_token(self) -> str:
@@ -237,12 +250,33 @@ class CockatielClient:
             if payload_key and payload_key in self._callbacks:
                 result = self._callbacks[payload_key](getattr(container, payload_key), container)
                 if asyncio.iscoroutine(result):
+                    if len(self._pending_tasks) >= self._max_pending_tasks:
+                        logger.warning(
+                            "Dropping new background task for '%s': %d already "
+                            "pending (cap %d).",
+                            payload_key,
+                            len(self._pending_tasks),
+                            self._max_pending_tasks,
+                        )
+                        result.close()
+                        return
                     # Run slow handlers (e.g. a multi-second TTS synthesis) as
                     # background tasks so the receive loop keeps processing
                     # frames — a slow handler must not block liveness probes.
-                    asyncio.create_task(result)
+                    task = asyncio.create_task(result)
+                    self._pending_tasks.append(task)
+                    task.add_done_callback(self._on_pending_done)
 
         await self.receive(_dispatch)
+
+    def _on_pending_done(self, task: asyncio.Task) -> None:
+        if task in self._pending_tasks:
+            self._pending_tasks.remove(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Background handler task failed: %s", exc)
 
     async def close(self) -> None:
         await self._ws.close()

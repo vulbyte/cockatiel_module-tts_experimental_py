@@ -22,6 +22,8 @@ import asyncio
 import json
 import logging
 import math
+import time
+from collections import OrderedDict
 
 from worker_manager import WorkerManager
 
@@ -113,6 +115,11 @@ def load_or_setup_config(args) -> dict:
     # Optional per-worker model override: an HF model id OR a local model dir,
     # passed to the active worker's load(model=...). Setting stays in config.
     config.setdefault("model_source", "")
+    # Safety caps so a pasted novel can't spawn a multi-minute render or push a
+    # giant blob into the timeline DB. All config-driven with sane defaults.
+    config.setdefault("max_chars", 1000)
+    config.setdefault("max_audio_bytes", 5 * 1024 * 1024)
+    config.setdefault("inference_timeout", 60)
     # Persist so the new setting always exists in config.json.
     CONFIG_PATH.write_text(json.dumps(config, indent=2))
 
@@ -198,21 +205,28 @@ async def main():
     pairing_pin = int(os.environ.get("COCKATIEL_PIN") or args.pin or 0)
     module_name = args.name or "tts-service"
 
-    client = await (
-        CockatielClient.connect(module_name)
-        .endpoint(engine_ip, engine_port)
-        .pin(pairing_pin)
-        .position("postprocess")
-        .connect()
-    )
-    logger.info("TTS Service connected as '%s' (postprocess).", module_name)
-
     # Serialize synthesis: the local model isn't safe for concurrent inference,
-    # and handlers now run as background tasks so probes are never blocked.
+    # and handlers now run as background tasks so probes are never blocked. A
+    # per-attempt deadline keeps a hung worker from holding the lock forever.
     synthesis_lock = asyncio.Semaphore(1)
+    inference_timeout = int(config.get("inference_timeout", 60))
 
-    @client.on("message_post_process")
-    async def handle_post_process(msg, container):
+    # Bounded dedup of recently-synthesized message uuids (oldest evicted) so a
+    # re-delivered message isn't re-rendered a second time.
+    max_dedup = 1000
+    recent_synthesis: OrderedDict[str, None] = OrderedDict()
+
+    def mark_synthesized(uuid7: str) -> None:
+        recent_synthesis[uuid7] = None
+        while len(recent_synthesis) > max_dedup:
+            recent_synthesis.popitem(last=False)
+
+    max_chars = int(config.get("max_chars", 1000))
+    max_audio_bytes = int(config.get("max_audio_bytes", 5 * 1024 * 1024))
+    model_source = config.get("model_source", "") or ""
+
+    async def handle_synthesis(client, msg, container) -> None:
+        """Render speech for one post-process message (runs as a background task)."""
         text_to_speak = msg.processed_message or ""
         if not text_to_speak.strip():
             if msg.raw_message is not None and msg.raw_message.raw_message:
@@ -220,14 +234,45 @@ async def main():
         if not text_to_speak.strip():
             return
 
+        if len(text_to_speak) > max_chars:
+            logger.info(
+                "[TTS Engine] Truncating %d-char message to %d chars for %s",
+                len(text_to_speak), max_chars, msg.message_uuid7,
+            )
+            text_to_speak = text_to_speak[:max_chars]
+
+        # Skip a message we already rendered (engine re-delivery, e.g. after a
+        # reconnect). Re-ack with the cached clip on disk so the stage still
+        # completes, but never re-run inference for the same uuid.
+        if msg.message_uuid7 in recent_synthesis:
+            logger.info(
+                "[TTS Engine] Skipping duplicate synthesis for %s (already rendered).",
+                msg.message_uuid7,
+            )
+            reply = pb.MessagePostProcess(
+                message_uuid7=msg.message_uuid7,
+                processed_message=text_to_speak,
+            )
+            cached_path = CLIPS_DIR / f"{get_safe_filename(text_to_speak)}_{msg.message_uuid7[:8]}.mp3"
+            if cached_path.exists():
+                try:
+                    reply.audio = cached_path.read_bytes()
+                    reply.audio_type = "audio/mpeg"
+                except OSError:
+                    pass
+            await client.send("message_post_process", reply)
+            return
+
         logger.info("[TTS Engine] Rendering speech for message: '%s'", text_to_speak)
         safe_name = get_safe_filename(text_to_speak)
         output_path = CLIPS_DIR / f"{safe_name}_{msg.message_uuid7[:8]}.mp3"
 
-        model_source = config.get("model_source", "") or None
         # Fallback order: the configured worker first, then every other
         # available worker. A worker that can't render (missing model, bad
-        # source, runtime error) is skipped, not fatal.
+        # source, runtime error) is skipped, not fatal. model_source is only
+        # passed to workers that support it (see
+        # WorkerManager.supports_model_source); workers incompatible with the
+        # configured source are skipped, not errored.
         candidates = [active_model] + [
             w for w in available if w != active_model
         ]
@@ -235,18 +280,36 @@ async def main():
         audio_bytes = b""
         rendered_by = None
         for worker in candidates:
+            supports_source = manager.supports_model_source(worker)
+            if model_source and not supports_source:
+                logger.info(
+                    "[TTS Engine] Skipping worker '%s': incompatible with configured model_source.",
+                    worker,
+                )
+                continue
+            worker_source = model_source if supports_source else ""
             try:
                 loop = asyncio.get_running_loop()
                 async with synthesis_lock:
-                    await loop.run_in_executor(
-                        None,
-                        manager.synthesize,
-                        worker,
-                        text_to_speak,
-                        str(output_path),
-                        model_source or "",
+                    await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            manager.synthesize,
+                            worker,
+                            text_to_speak,
+                            str(output_path),
+                            worker_source,
+                        ),
+                        timeout=inference_timeout,
                     )
                 audio_bytes = output_path.read_bytes()
+                if len(audio_bytes) > max_audio_bytes:
+                    logger.warning(
+                        "[TTS Engine] Worker '%s' produced %d bytes for %s — "
+                        "over %d-byte cap; dropping audio.",
+                        worker, len(audio_bytes), msg.message_uuid7, max_audio_bytes,
+                    )
+                    audio_bytes = b""
                 rendered_by = worker
                 break
             except Exception as e:
@@ -282,14 +345,62 @@ async def main():
             reply.audio = audio_bytes
             reply.audio_type = "audio/mpeg"
         await client.send("message_post_process", reply)
+        mark_synthesized(msg.message_uuid7)
 
         # Optional local playback for standalone/no-display setups.
         if config.get("play_locally", False):
-            volume = float(config.get("volume", 0.4))
+            try:
+                volume = float(config.get("volume", 0.4))
+            except (TypeError, ValueError):
+                logger.warning("Invalid 'volume' in config; using 0.4.")
+                volume = 0.4
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, play_audio, str(output_path), volume)
 
-    logger.info("Listening for incoming Cockatiel engine stream payloads...")
-    await client.listen()
+    # Connect + listen with automatic reconnect: a closed WebSocket ends
+    # listen() and we reconnect with exponential backoff (1s, 2s, 4s, ... capped
+    # at 30s). The client performs a fresh ConnectionRequest + auth on every
+    # connect, so re-instantiating it per iteration re-authenticates cleanly.
+    reconnect_backoff = 1.0
+    max_backoff = 30.0
+    while True:
+        session_start = time.monotonic()
+        client = None
+        try:
+            client = await (
+                CockatielClient.connect(module_name)
+                .endpoint(engine_ip, engine_port)
+                .pin(pairing_pin)
+                .position("postprocess")
+                .connect()
+            )
+            logger.info("TTS Service connected as '%s' (postprocess).", module_name)
+
+            @client.on("message_post_process")
+            async def handle_post_process(msg, container, _client=client):
+                await handle_synthesis(_client, msg, container)
+
+            logger.info("Listening for incoming Cockatiel engine stream payloads...")
+            await client.listen()
+            logger.warning("TTS Service connection to engine closed.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("TTS Service connection error: %s", e)
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+
+        # Reset the backoff after a healthy session; otherwise keep doubling.
+        if time.monotonic() - session_start >= max_backoff:
+            reconnect_backoff = 1.0
+        else:
+            reconnect_backoff = min(reconnect_backoff * 2, max_backoff)
+        logger.info("Reconnecting to engine in %.0fs...", reconnect_backoff)
+        await asyncio.sleep(reconnect_backoff)
 
 
 if __name__ == "__main__":

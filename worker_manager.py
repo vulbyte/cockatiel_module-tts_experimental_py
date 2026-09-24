@@ -108,6 +108,23 @@ class WorkerManager:
         model = self._get_model(name, model_source)
         module.synthesize(model, message, output_path)
 
-    def unload(self, name: str) -> None:
-        """Drop a cached model (e.g. to free GPU memory before switching)."""
-        self._loaded_models.pop(name, None)
+    def supports_model_source(self, name: str) -> bool:
+        """Whether a worker's load() accepts a `model_source` override.
+
+        A worker declares support by setting a module-level
+        `MODEL_SOURCE_SUPPORTED = True` (see workers/mms.py). Workers with a
+        fixed architecture (SpeechT5, Qwen3) don't declare it, so a custom HF
+        id / local dir configured for another model is never force-fed into
+        them.
+        """
+        module = self._get_module(name)
+        return bool(getattr(module, "MODEL_SOURCE_SUPPORTED", False))
+
+    def unload(self, name: str, model_source: str = "") -> None:
+        """Drop a cached model (e.g. to free GPU memory before switching).
+
+        Keyed on the same `name|source` composite used by `_get_model`, so a
+        source-parameterized model is actually released from the cache.
+        """
+        key = f"{name}|{model_source}" if model_source else name
+        self._loaded_models.pop(key, None)

@@ -7,6 +7,10 @@ import torch
 from pydub import AudioSegment
 from transformers import pipeline
 
+# This worker uses a generic text-to-speech pipeline, so it can load any
+# compatible HF model id / local dir passed via model_source.
+MODEL_SOURCE_SUPPORTED = True
+
 
 def load(model=None):
     device = 0 if torch.cuda.is_available() else -1
