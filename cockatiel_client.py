@@ -81,6 +81,9 @@ class CockatielClientBuilder:
         self._pin = 0
         self._priority = 10
         self._process_position = "postprocess"
+        self._open_timeout = 10.0
+        self._handshake_timeout = 10.0
+        self._max_pending_tasks = 16
 
     def endpoint(self, ip: str, port: int) -> "CockatielClientBuilder":
         self._ip = ip
@@ -99,6 +102,18 @@ class CockatielClientBuilder:
         self._process_position = position
         return self
 
+    def open_timeout(self, seconds: float) -> "CockatielClientBuilder":
+        self._open_timeout = seconds
+        return self
+
+    def handshake_timeout(self, seconds: float) -> "CockatielClientBuilder":
+        self._handshake_timeout = seconds
+        return self
+
+    def max_pending_tasks(self, cap: int) -> "CockatielClientBuilder":
+        self._max_pending_tasks = cap
+        return self
+
     async def connect(self) -> "CockatielClient":
         # WSS when the supervisor points us at the engine's self-signed cert
         # (COCKATIEL_TLS_CERT) — the engine rejects plain ws://. The cert is
@@ -114,7 +129,7 @@ class CockatielClientBuilder:
             ws_kwargs["ssl"] = ctx
         # Bound the connect so the service's reconnect loop can back off instead
         # of hanging forever on an unreachable engine.
-        ws_kwargs["open_timeout"] = 10.0
+        ws_kwargs["open_timeout"] = self._open_timeout
         ws = await websockets.connect(engine_ws_url, **ws_kwargs)
         logger.info("Connected to WebSocket! Sending authentication handshake...")
 
@@ -135,7 +150,7 @@ class CockatielClientBuilder:
 
         await ws.send(handshake_container.SerializeToString())
         try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+            raw = await asyncio.wait_for(ws.recv(), timeout=self._handshake_timeout)
         except asyncio.TimeoutError:
             await ws.close()
             raise ConnectionError("Authentication timed out: engine did not reply to handshake.")
@@ -158,7 +173,9 @@ class CockatielClientBuilder:
 
         assigned_uuid = resp.connection_request_return.module_instance_uuid7
         logger.info("Successfully authenticated with Cockatiel Engine!")
-        return CockatielClient(ws, self._module_name, auth_token, assigned_uuid)
+        return CockatielClient(
+            ws, self._module_name, auth_token, assigned_uuid, self._max_pending_tasks
+        )
 
 
 class CockatielClient:

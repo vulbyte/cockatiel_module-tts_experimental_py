@@ -8,6 +8,8 @@ This version loads the real SpeechT5 model + vocoder and always exports
 through pydub.
 """
 
+import os
+
 import numpy as np
 import torch
 from datasets import load_dataset
@@ -18,6 +20,9 @@ MODEL_ID = "microsoft/speecht5_tts"
 VOCODER_ID = "microsoft/speecht5_hifigan"
 SPEAKER_EMBEDDINGS_DATASET = "Matthijs/cmu-arctic-xvectors"
 SAMPLE_RATE = 16000  # SpeechT5's native output rate
+# The CMU ARCTIC xvector index that picks the voice. The service sets
+# TTS_SPEAKER_INDEX from config.json when present; this is the shipped default.
+DEFAULT_SPEAKER_INDEX = 7306
 
 
 def load(model=None):
@@ -26,9 +31,11 @@ def load(model=None):
     vocoder = SpeechT5HifiGan.from_pretrained(VOCODER_ID)
 
     # A fixed speaker voice from the standard CMU ARCTIC embeddings set.
-    # Swap the index below to change the voice.
+    # Tune the voice via the TTS_SPEAKER_INDEX env var (set by the service
+    # from config.json's `speaker_index`).
+    speaker_index = int(os.environ.get("TTS_SPEAKER_INDEX", DEFAULT_SPEAKER_INDEX))
     embeddings_dataset = load_dataset(SPEAKER_EMBEDDINGS_DATASET, split="validation")
-    speaker_embeddings = torch.tensor(embeddings_dataset[7306]["xvector"]).unsqueeze(0)
+    speaker_embeddings = torch.tensor(embeddings_dataset[speaker_index]["xvector"]).unsqueeze(0)
 
     return processor, model_obj, vocoder, speaker_embeddings
 

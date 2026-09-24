@@ -19,6 +19,8 @@ from cockatiel_client import CockatielClient, pb
 
 import argparse
 import asyncio
+import atexit
+import concurrent.futures
 import json
 import logging
 import math
@@ -120,6 +122,27 @@ def load_or_setup_config(args) -> dict:
     config.setdefault("max_chars", 1000)
     config.setdefault("max_audio_bytes", 5 * 1024 * 1024)
     config.setdefault("inference_timeout", 60)
+    # Tuning values (all defaulted; created in config.json when missing).
+    # How many syntheses may run concurrently (1 = fully serialized).
+    config.setdefault("synthesis_concurrency", 1)
+    # Cap on the recently-synthesized-uuid dedup set (oldest evicted).
+    config.setdefault("max_dedup", 1000)
+    # WebSocket open handshake timeout (seconds), passed to the client.
+    config.setdefault("open_timeout", 10)
+    # Engine auth handshake reply timeout (seconds), passed to the client.
+    config.setdefault("handshake_timeout", 10)
+    # Cap on in-flight background handler tasks in the client.
+    config.setdefault("max_pending_tasks", 16)
+    # Reconnect backoff base (seconds).
+    config.setdefault("reconnect_backoff_base", 1.0)
+    # Reconnect backoff cap (seconds).
+    config.setdefault("reconnect_backoff_max", 30.0)
+    # A session this long (seconds) resets the reconnect backoff to base.
+    config.setdefault("backoff_reset_threshold", 30)
+    # Dedicated thread pool for synthesis/playback; 0 = default executor.
+    config.setdefault("worker_threads", 0)
+    # SpeechT5 CMU ARCTIC xvector index (voice); exported via TTS_SPEAKER_INDEX.
+    config.setdefault("speaker_index", 7306)
     # Persist so the new setting always exists in config.json.
     CONFIG_PATH.write_text(json.dumps(config, indent=2))
 
@@ -172,6 +195,14 @@ async def main():
         logger.warning("Configured model '%s' not found. Falling back to '%s'", active_model, available[0])
         active_model = available[0]
 
+    # Optional dedicated executor for the blocking synthesize/playback calls;
+    # 0/None keeps the asyncio default executor (behavior identical).
+    worker_threads = int(config.get("worker_threads", 0) or 0)
+    thread_executor = None
+    if worker_threads > 0:
+        thread_executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_threads)
+        atexit.register(thread_executor.shutdown)
+
     # Handle local testing mode via --test flag
     if args.test:
         logger.info("Running in TEST mode using model '%s'", active_model)
@@ -183,7 +214,7 @@ async def main():
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                None,
+                thread_executor,
                 manager.synthesize,
                 active_model,
                 args.test,
@@ -208,12 +239,14 @@ async def main():
     # Serialize synthesis: the local model isn't safe for concurrent inference,
     # and handlers now run as background tasks so probes are never blocked. A
     # per-attempt deadline keeps a hung worker from holding the lock forever.
-    synthesis_lock = asyncio.Semaphore(1)
+    # Concurrency is configurable (default 1 = fully serialized).
+    synthesis_concurrency = max(1, int(config.get("synthesis_concurrency", 1)))
+    synthesis_lock = asyncio.Semaphore(synthesis_concurrency)
     inference_timeout = int(config.get("inference_timeout", 60))
 
     # Bounded dedup of recently-synthesized message uuids (oldest evicted) so a
     # re-delivered message isn't re-rendered a second time.
-    max_dedup = 1000
+    max_dedup = int(config.get("max_dedup", 1000))
     recent_synthesis: OrderedDict[str, None] = OrderedDict()
 
     def mark_synthesized(uuid7: str) -> None:
@@ -224,6 +257,10 @@ async def main():
     max_chars = int(config.get("max_chars", 1000))
     max_audio_bytes = int(config.get("max_audio_bytes", 5 * 1024 * 1024))
     model_source = config.get("model_source", "") or ""
+
+    # Export the SpeechT5 speaker voice (CMU ARCTIC xvector index) to the
+    # worker via env var — worker modules read it at model-load time.
+    os.environ["TTS_SPEAKER_INDEX"] = str(int(config.get("speaker_index", 7306)))
 
     async def handle_synthesis(client, msg, container) -> None:
         """Render speech for one post-process message (runs as a background task)."""
@@ -293,7 +330,7 @@ async def main():
                 async with synthesis_lock:
                     await asyncio.wait_for(
                         loop.run_in_executor(
-                            None,
+                            thread_executor,
                             manager.synthesize,
                             worker,
                             text_to_speak,
@@ -355,14 +392,18 @@ async def main():
                 logger.warning("Invalid 'volume' in config; using 0.4.")
                 volume = 0.4
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, play_audio, str(output_path), volume)
+            await loop.run_in_executor(thread_executor, play_audio, str(output_path), volume)
 
     # Connect + listen with automatic reconnect: a closed WebSocket ends
-    # listen() and we reconnect with exponential backoff (1s, 2s, 4s, ... capped
-    # at 30s). The client performs a fresh ConnectionRequest + auth on every
-    # connect, so re-instantiating it per iteration re-authenticates cleanly.
-    reconnect_backoff = 1.0
-    max_backoff = 30.0
+    # listen() and we reconnect with exponential backoff. The client performs a
+    # fresh ConnectionRequest + auth on every connect, so re-instantiating it
+    # per iteration re-authenticates cleanly.
+    reconnect_backoff = float(config.get("reconnect_backoff_base", 1.0))
+    max_backoff = float(config.get("reconnect_backoff_max", 30.0))
+    backoff_reset_threshold = float(config.get("backoff_reset_threshold", 30))
+    open_timeout = float(config.get("open_timeout", 10))
+    handshake_timeout = float(config.get("handshake_timeout", 10))
+    max_pending_tasks = int(config.get("max_pending_tasks", 16))
     while True:
         session_start = time.monotonic()
         client = None
@@ -372,6 +413,9 @@ async def main():
                 .endpoint(engine_ip, engine_port)
                 .pin(pairing_pin)
                 .position("postprocess")
+                .open_timeout(open_timeout)
+                .handshake_timeout(handshake_timeout)
+                .max_pending_tasks(max_pending_tasks)
                 .connect()
             )
             logger.info("TTS Service connected as '%s' (postprocess).", module_name)
@@ -395,8 +439,8 @@ async def main():
                     pass
 
         # Reset the backoff after a healthy session; otherwise keep doubling.
-        if time.monotonic() - session_start >= max_backoff:
-            reconnect_backoff = 1.0
+        if time.monotonic() - session_start >= backoff_reset_threshold:
+            reconnect_backoff = float(config.get("reconnect_backoff_base", 1.0))
         else:
             reconnect_backoff = min(reconnect_backoff * 2, max_backoff)
         logger.info("Reconnecting to engine in %.0fs...", reconnect_backoff)
