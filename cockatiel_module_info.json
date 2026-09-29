@@ -1,6 +1,6 @@
 {
-  "name": "tts-service",
-  "description": "takes in a MesasgePostProcess object, and it then returns a blob with either an mp3 or wav",
+  "name": "tts-experimental-py",
+  "description": "OPT-IN experimental text-to-speech for model families the default Rust tts-rs module does not support (XTTS, Kokoro, F5, MeloTTS, Chatterbox, MMS, etc.). Requires a working Python environment (pip packages are auto-installed on first run). Start it manually from the modules window; not auto-started by default.",
   "version": "0.1.0",
   "capabilities": "postprocess",
   "root_file": "./tts_service.py",
@@ -8,5 +8,5 @@
   "command_flags": [
     "./tts_service.py"
   ],
-  "autostart": true
+  "autostart": false
 }

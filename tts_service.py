@@ -441,7 +441,7 @@ async def main():
     engine_ip = config.get("engine_ip", "127.0.0.1")
     engine_port = int(config.get("engine_port", 9734))
     pairing_pin = int(os.environ.get("COCKATIEL_PIN") or args.pin or 0)
-    module_name = args.name or "tts-service"
+    module_name = args.name or "tts-experimental-py"
 
     # Serialize synthesis: the local model isn't safe for concurrent inference,
     # and handlers now run as background tasks so probes are never blocked. A
