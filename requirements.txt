@@ -10,3 +10,16 @@ datasets       # needed by workers/speecht5.py for speaker embeddings
 
 # System dependency (not pip-installable): ffmpeg, required by pydub for
 # mp3 export/decoding.
+
+# --- Optional TTS runtimes (lazy-imported inside each worker's load()) ---
+# None of these are required: a missing one only disables that one worker (it
+# is skipped by the service's per-worker fallback). They are imported lazily
+# inside each worker's load() so the module itself always imports cleanly and
+# supports_model_source() never aborts a message. Heavy platform-specific
+# deps are noted per line.
+coqui-tts        # workers/xtts.py -- Coqui XTTS-v2; pulls torch (already present) + a lot of TTS deps
+piper-tts        # workers/piper.py -- ONNX voices; onnxruntime (already present), espeak-ng phonemizer bundled
+kokoro           # workers/kokoro.py -- Kokoro-82M (torch-based); also needs misaki[en]
+MeloTTS          # workers/melo.py -- MeloTTS; needs nltk 'averaged_perceptron_tagger_eng' data (JP also needs unidic)
+f5-tts           # workers/f5.py -- F5-TTS; pulls cached_path/hydra/omegaconf; downloads vocoder+ckpt weights at runtime
+chatterbox-tts   # workers/chatterbox.py -- Chatterbox; pulls perth, s3tokenizer, conformer, librosa

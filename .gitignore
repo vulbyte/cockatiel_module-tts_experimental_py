@@ -1,5 +1,5 @@
 # we don't need mic audio files here
-./clips/*
+/clips/
 
 .# Byte-compiled / optimized / DLL files
 __pycache__/
@@ -228,3 +228,6 @@ config.json
 
 # Generated protobuf cache
 .cockatiel_pb2_cache/
+
+# Downloaded TTS voices (regenerable, ~60MB each) — never commit.
+piper_voices/

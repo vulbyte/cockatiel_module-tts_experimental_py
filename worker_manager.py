@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import subprocess
 import sys
 import threading
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Tuple, Union
 
 logger = logging.getLogger("worker_manager")
 
@@ -108,6 +109,17 @@ class WorkerManager:
         model = self._get_model(name, model_source)
         module.synthesize(model, message, output_path)
 
+    def warm_up(self, name: str, message: str, output_path: str, model_source: str = "") -> None:
+        """Load the model AND render one clip, proving the worker works end to end.
+
+        Identical to `synthesize` -- the point is the call site: this is used
+        at STARTUP, before the module connects to the engine, so a worker that
+        cannot load its model or render audio fails here instead of on the
+        first real chat message (which used to be when the model was lazily
+        loaded, erroring that message).
+        """
+        self.synthesize(name, message, output_path, model_source)
+
     def supports_model_source(self, name: str) -> bool:
         """Whether a worker's load() accepts a `model_source` override.
 
@@ -117,8 +129,91 @@ class WorkerManager:
         id / local dir configured for another model is never force-fed into
         them.
         """
-        module = self._get_module(name)
+        try:
+            module = self._get_module(name)
+        except Exception:
+            # A worker whose module can't even be imported (e.g. a missing
+            # optional runtime imported at top level) is treated as having no
+            # source support rather than raising: tts_service calls this OUTSIDE
+            # its per-worker try/except, so an import error here would otherwise
+            # abort the whole fallback chain for a message.
+            logger.warning(
+                "Worker '%s' could not be imported; treating as source-unsupported.",
+                name,
+                exc_info=True,
+            )
+            return False
         return bool(getattr(module, "MODEL_SOURCE_SUPPORTED", False))
+
+    def required_pip(self, name: str) -> List[Tuple[str, str]]:
+        """The (pip package, importable name) pairs a worker needs.
+
+        Declared as a module-level `REQUIRED_PIP` list on the worker. Returns
+        an empty list for a worker that declares none (no runtime dependency
+        beyond the hard deps).
+        """
+        module = self._get_module(name)
+        raw = getattr(module, "REQUIRED_PIP", [])
+        return [(str(p), str(i)) for p, i in raw]
+
+    def ensure_dependencies(
+        self,
+        name: str,
+        auto_install: bool = True,
+        pip: List[str] = None,
+    ) -> List[str]:
+        """Make sure every runtime a worker needs is importable.
+
+        Returns the pip packages that were INSTALLED (empty if all were already
+        present). With `auto_install=False` it only reports what is missing and
+        installs nothing, so a headless check or a dry run can call it without
+        touching the environment. `pip` is the install command prefix (default
+        `[sys.executable, "-m", "pip", "install"]`), injectable for tests.
+
+        The lazy-import design means the worker's module imports cleanly even
+        when its runtime is absent, so the missing import can be detected here
+        (via importlib.util.find_spec) and installed BEFORE load() runs. A
+        worker whose runtime install fails is still skipped by the service's
+        fallback chain -- this just makes the happy path work without the
+        operator reaching for a shell.
+        """
+        installed: List[str] = []
+        for pip_pkg, import_name in self.required_pip(name):
+            if importlib.util.find_spec(import_name) is not None:
+                continue
+            if not auto_install:
+                logger.warning(
+                    "Worker '%s' needs '%s' (import '%s') which is not installed.",
+                    name, pip_pkg, import_name,
+                )
+                continue
+            logger.info(
+                "Worker '%s' needs '%s' (import '%s') — installing...",
+                name, pip_pkg, import_name,
+            )
+            cmd = (pip or [sys.executable, "-m", "pip", "install"]) + [pip_pkg]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+            except Exception as e:
+                logger.error(
+                    "Auto-install of '%s' for worker '%s' failed to run: %s",
+                    pip_pkg, name, e,
+                )
+                continue
+            if result.returncode != 0:
+                logger.error(
+                    "Auto-install of '%s' for worker '%s' FAILED (exit %d):\n%s",
+                    pip_pkg, name, result.returncode, result.stderr.strip() or result.stdout.strip(),
+                )
+                continue
+            logger.info("Installed '%s' for worker '%s'.", pip_pkg, name)
+            installed.append(pip_pkg)
+        return installed
 
     def unload(self, name: str, model_source: str = "") -> None:
         """Drop a cached model (e.g. to free GPU memory before switching).
@@ -128,3 +223,87 @@ class WorkerManager:
         """
         key = f"{name}|{model_source}" if model_source else name
         self._loaded_models.pop(key, None)
+
+    def ensure_torch_compat(self, auto_install: bool = True) -> str:
+        """Detect (and optionally fix) a torch / torchvision version mismatch.
+
+        PyTorch pairs each `torch` release with a specific `torchvision` (the
+        rule: torchvision's minor is torch's minor + 15, e.g. torch 2.6.0 ↔
+        torchvision 0.21.0). A mismatched pair makes `import torchvision`
+        crash with `RuntimeError: operator torchvision::nms does not exist`,
+        which in turn breaks `transformers` — every torch-based TTS worker
+        then fails to load and the service sits in the TUI's "starting" loop
+        forever. This is a broken ENVIRONMENT, not a worker bug, so it is
+        fixed here rather than surfaced as an opaque per-worker error.
+
+        Reads versions via `importlib.metadata` (metadata only, never imports
+        torch — importing torch is exactly what crashes on a mismatch). Returns
+        a human-readable result describing what was found and what was done.
+        """
+        try:
+            import importlib.metadata as md
+
+            torch_ver = md.version("torch")
+            torchvision_ver = md.version("torchvision")
+        except md.PackageNotFoundError:
+            # torch/torchvision absent entirely: a worker that needs it simply
+            # won't be importable, and `ensure_dependencies` handles that.
+            return "torch not installed; nothing to align"
+        except Exception as e:  # noqa: BLE001 -- metadata reads must never kill warm-up
+            return f"could not read torch versions: {e}"
+
+        def minor(v: str) -> int:
+            try:
+                return int(v.split(".")[1])
+            except (IndexError, ValueError):
+                return -1
+
+        torch_minor = minor(torch_ver)
+        tv_minor = minor(torchvision_ver)
+        expected_tv = f"0.{torch_minor + 15}.0" if torch_minor >= 0 else None
+
+        if expected_tv and tv_minor == torch_minor + 15:
+            return (
+                f"torch {torch_ver} + torchvision {torchvision_ver} "
+                "match; no action needed"
+            )
+        if expected_tv is None:
+            return f"unparseable torch version {torch_ver!r}; not aligning"
+
+        if not auto_install:
+            return (
+                f"MISMATCH: torch {torch_ver} pairs with torchvision "
+                f"{expected_tv}, but torchvision {torchvision_ver} is installed. "
+                "Run with auto_install_deps on (or pip install "
+                f"'torchvision=={expected_tv}') to fix."
+            )
+
+        logger.warning(
+            "torch/torchvision MISMATCH: torch %s needs torchvision %s, but "
+            "%s is installed — installing the matching torchvision. (A broken "
+            "pair crashes import torchvision and takes every torch-based worker "
+            "down with it.)",
+            torch_ver, expected_tv, torchvision_ver,
+        )
+        cmd = [
+            sys.executable, "-m", "pip", "install", "--upgrade",
+            f"torchvision=={expected_tv}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except Exception as e:
+            return f"auto-fix failed to run: {e}"
+        if result.returncode != 0:
+            return (
+                f"auto-fix FAILED (exit {result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return (
+            f"aligned torchvision {torchvision_ver} -> {expected_tv} "
+            f"to match torch {torch_ver}"
+        )
