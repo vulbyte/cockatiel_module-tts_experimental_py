@@ -55,5 +55,10 @@
       "list": false,
       "sensitive": false
     }
-  ]
+  ],
+  "release": {
+    "repo": "vulbyte/cockatiel_module-tts_experimental_py",
+    "base_url": "https://github.com/vulbyte/cockatiel_module-tts_experimental_py/releases/download",
+    "tag": "v0.1.0"
+  }
 }
